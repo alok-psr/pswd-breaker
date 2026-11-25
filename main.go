@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -75,11 +76,31 @@ func renderTable(area *pterm.AreaPrinter, states []routineData, width int) {
 	area.Update(tableStr)
 }
 
+func EndRageGen(digs int) int {
+	strEnd := ""
+	for range digs {
+		strEnd += "9"
+	}
+	strVal, err := strconv.Atoi(strEnd)
+	if err != nil {
+		fmt.Println("error occoured for end rage gen ", err)
+		os.Exit(1)
+		return -1
+	} else {
+		return strVal
+	}
+}
+
 func main() {
-	PSWD := 99999999
+	pswdPtr := flag.Int("p", 999999, "Target password to crack")
+	partitionPtr := flag.Int("w", 4, "Number of workers to allocate")
+
+	flag.Parse()
+
+	PSWD := *pswdPtr
 	PswdLen := len(fmt.Sprintf("%d", PSWD))
-	Partitions := 4
-	EndRange := PSWD
+	Partitions := *partitionPtr
+	EndRange := EndRageGen(PswdLen)
 
 	WorkersRange := int(EndRange / Partitions)
 	result := make(chan int, 1)
@@ -96,6 +117,8 @@ func main() {
 
 	start := 0
 	end := 0
+
+	startTime := time.Now()
 	for i := range Partitions {
 		wg.Add(1)
 
@@ -162,12 +185,12 @@ func main() {
 
 	// Wait for all workers to finish
 	wg.Wait()
-
+	elapsed := time.Since(startTime)
 	// Shut down UI cleanly before printing final output
 	close(stopUI)
 	<-uiDone
 	area.Stop()
 
 	crackedPswd := <-result
-	fmt.Printf("\nGot the password: %d\n", crackedPswd)
+	fmt.Printf("\nGot the password: %d\nTime Taken to crack the password: %s", crackedPswd, elapsed)
 }
