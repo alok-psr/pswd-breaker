@@ -1,18 +1,26 @@
 package main
 
-// change the endrange to normal
-// get the tui working in the table in the pterm library
 import (
 	"context"
 	"fmt"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/pterm/pterm"
 )
+
+type routineData struct {
+	id      int
+	status  atomic.Int32 // 0 = working ; 1 = completed ; 2 = waiting ; 3 = terminated
+	current atomic.Int64 // current iteration
+	domain  []int        // 2 values => 0 : start; 1 : end
+}
 
 func changeWidth(width, num int) int {
 	strVal := fmt.Sprintf("%0*d", width, num)
-	// calc the int versin of the strVal and return
 	intVal, err := strconv.Atoi(strVal)
 	if err != nil {
 		fmt.Printf("%e", err)
@@ -21,30 +29,76 @@ func changeWidth(width, num int) int {
 	return intVal
 }
 
+func getStatusLabel(code int32) string {
+	switch code {
+	case 0:
+		return pterm.LightCyan("Working...")
+	case 1:
+		return pterm.LightGreen("CRACKED!")
+	case 2:
+		return pterm.Gray("Waiting")
+	case 3:
+		return pterm.LightRed("Terminated")
+	default:
+		return "Unknown"
+	}
+}
+
+func renderTable(area *pterm.AreaPrinter, states []routineData, width int) {
+	alternateStyle := pterm.NewStyle(pterm.BgDarkGray)
+
+	table := pterm.TableData{
+		[]string{"GoRoutine", "Range", "Current-Iteration", "Status"},
+	}
+
+	for i := range states {
+		rangeStr := fmt.Sprintf("%0*d - %0*d", width, states[i].domain[0], width, states[i].domain[1]-1)
+		currStr := fmt.Sprintf("%0*d", width, states[i].current.Load())
+
+		row := []string{
+			fmt.Sprintf("Worker-%d", states[i].id),
+			rangeStr,
+			currStr,
+			getStatusLabel(states[i].status.Load()),
+		}
+		table = append(table, row)
+	}
+
+	// Srender() builds the table as a string so area.Update() can overwrite it in place
+	tableStr, _ := pterm.DefaultTable.
+		WithHasHeader().
+		WithBoxed().
+		WithData(table).
+		WithAlternateRowStyle(alternateStyle).
+		Srender()
+
+	area.Update(tableStr)
+}
+
 func main() {
 	PSWD := 99999999
 	PswdLen := len(fmt.Sprintf("%d", PSWD))
 	Partitions := 4
 	EndRange := PSWD
-	//EndRange := 99999999
-	WorkersRange := int(EndRange / Partitions)
 
+	WorkersRange := int(EndRange / Partitions)
 	result := make(chan int, 1)
 
-	fmt.Printf("Target Password :: %d \nUsing %d Workers each having %d range\n", PSWD, Partitions, WorkersRange)
+	// Pre-allocate slice so memory addresses never shift while goroutines run
+	routineDataSlice := make([]routineData, Partitions)
+
+	fmt.Printf("Target Password :: %d \nUsing %d Workers each having %d range\n\n", PSWD, Partitions, WorkersRange)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-
 	defer cancel()
+
+	var wg sync.WaitGroup
 
 	start := 0
 	end := 0
 	for i := range Partitions {
 		wg.Add(1)
 
-		// start,end define the range for the go routine
-		// ctx is the context
 		start = end
 		if i == Partitions-1 {
 			end = EndRange + 1
@@ -52,23 +106,29 @@ func main() {
 			end = end + WorkersRange
 		}
 
+		// Initialize each worker's slot before launching its goroutine
+		routineDataSlice[i].id = i
+		routineDataSlice[i].status.Store(2) // 2 = waiting
+		routineDataSlice[i].domain = []int{start, end}
+
 		go func(ctx context.Context, startIndex, endIndex, i int) {
 			defer wg.Done()
-			// logic for brute forcing the pswd
-			// if we have the pswd then we set the channel finding to false
-			// if the finding is false then we cancel the context --out of the for loop
 
-			fmt.Printf("workder %d spawned successfully\n", i)
+			routineDataSlice[i].status.Store(0) // 0 = working
+
 			for tempPswd := startIndex; tempPswd < endIndex; tempPswd++ {
 				select {
 				case <-ctx.Done():
+					routineDataSlice[i].status.Store(3) // 3 = terminated
 					return
 
 				default:
+					// Update current iteration for the UI table
+					routineDataSlice[i].current.Store(int64(tempPswd))
+
 					currPswd := changeWidth(PswdLen, tempPswd)
-					// if we have cracked the Password then cancel else itterate further
 					if currPswd == PSWD {
-						fmt.Println("got the password")
+						routineDataSlice[i].status.Store(1) // 1 = completed/cracked
 						cancel()
 						result <- PSWD
 						return
@@ -76,11 +136,38 @@ func main() {
 				}
 			}
 		}(ctx, start, end, i)
-
 	}
-	fmt.Println("waiting wg")
+
+	// Start the live-updating area
+	area, _ := pterm.DefaultArea.WithCenter().Start()
+
+	// Run UI refresh loop in its own goroutine
+	stopUI := make(chan struct{})
+	uiDone := make(chan struct{})
+	go func() {
+		defer close(uiDone)
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopUI:
+				renderTable(area, routineDataSlice, PswdLen) // Draw final frame
+				return
+			case <-ticker.C:
+				renderTable(area, routineDataSlice, PswdLen)
+			}
+		}
+	}()
+
+	// Wait for all workers to finish
 	wg.Wait()
-	fmt.Println("waiting complete")
+
+	// Shut down UI cleanly before printing final output
+	close(stopUI)
+	<-uiDone
+	area.Stop()
+
 	crackedPswd := <-result
-	fmt.Printf("got the password %d", crackedPswd)
+	fmt.Printf("\nGot the password: %d\n", crackedPswd)
 }
